@@ -1,0 +1,149 @@
+Solution Approach:
+> Create a staging table use COPY INTO command to load data from files
+> Create tables to store data for each country
+> Calculate "age" and "days_since_last_consulted" while populating data in country tables
+> Create a prcodure to Run Merge into command daily to keep inserting/updating the data daily, if the record is already present in Target table -> Update the row values, if not present - > INSERT
+
+
+
+Solution:
+
+> Create an Integration to connect with S3
+CREATE STORAGE INTEGRATION s3_integration
+TYPE = EXTERNAL_STAGE
+STORAGE_PROVIDER = 'S3'
+STORAGE_AWS_ROLE_ARN = 'AWS ARN name'
+STORAGE_ALLOWED_LOCATIONS = 'storage location';
+
+
+> Create an external stage to access S3 files:
+CREATE STAGE s3_stage
+STORAGE_INTEGRATION = s3_integration
+FILE_FORMAT = (TYPE = CSV);
+
+
+> Create stage table:
+CREATE TABLE staging_table (
+    name string,
+    cust_i int,
+    open_dt int,
+    Consul_Dt int,
+    vac_id CHAR(5),
+    dr_name string,
+    state CHAR(5),
+    country CHAR(5),
+    dob int,
+    flag CHAR(1)
+);
+
+
+> Copy Data to Staging Table:
+COPY INTO staging_table
+FROM @s3_stage
+ON_ERROR = 'CONTINUE';
+
+
+> Create Table for Each COuntry:
+CREATE PROCEDURE create_country_tables()
+RETURNS STRING
+LANGUAGE SQL
+AS $$
+DECLARE
+    countries ARRAY;
+BEGIN
+    SELECT ARRAY_AGG(DISTINCT country) INTO countries FROM staging_table;
+    FOR country IN ARRAY_ITERATOR(countries) DO
+        EXECUTE IMMEDIATE
+        'CREATE OR REPLACE TABLE ' || country || '_customers AS 
+         SELECT 
+    name,
+    cust_i,
+    TO_DATE(Open_Dt, 'YYYYMMDD') as open_dt,
+    TO_DATE(Consul_Dt, 'YYYYMMDD') as Consul_Dt,
+    vac_id,
+    dr_name,
+    state,
+    country,
+    TO_DATE(LPAD(DOB::STRING, 8, '0'), 'DDMMYYYY') AS DOB,
+    flag,
+    DATEDIFF(YEAR, TO_DATE(LPAD(DOB::STRING, 8, '0'), 'DDMMYYYY'), CURRENT_DATE()) AS Age,
+    DATEDIFF(DAY, TO_DATE(Consul_Dt, 'YYYYMMDD'), CURRENT_DATE()) AS Days_Since_Last_Consulted
+         FROM staging_table WHERE country = ''' || country || '''';
+    END FOR;
+    RETURN 'Tables Created.';
+END;
+$$;
+
+-- Call the procedure
+CALL create_country_tables();
+
+
+
+
+
+> RUN MERGE INTO COMMAND FROM SECOND TIME TO KEEP ONLY LATEST RECORD for the Customer
+
+CREATE PROCEDURE update_data()
+  RETURNS STRING
+  LANGUAGE SQL
+  EXECUTE AS CALLER
+AS
+$$
+DECLARE
+  country_name STRING;
+BEGIN
+  FOR country_rec IN (SELECT DISTINCT Country FROM staging_table)
+  DO
+    LET country_name = country_rec.Country;
+    EXECUTE IMMEDIATE 
+    '
+      MERGE INTO table_' || country_name || ' AS target
+      USING (
+        SELECT 
+    name,
+    cust_i,
+    TO_DATE(Open_Dt, 'YYYYMMDD') as open_dt,
+    TO_DATE(Consul_Dt, 'YYYYMMDD') as Consul_Dt,
+    vac_id,
+    dr_name,
+    state,
+    country,
+    TO_DATE(LPAD(DOB::STRING, 8, '0'), 'DDMMYYYY') AS DOB,
+    flag,
+    DATEDIFF(YEAR, TO_DATE(LPAD(DOB::STRING, 8, '0'), 'DDMMYYYY'), CURRENT_DATE()) AS Age,
+    DATEDIFF(DAY, TO_DATE(Consul_Dt, 'YYYYMMDD'), CURRENT_DATE()) AS Days_Since_Last_Consulted
+        FROM staging_table 
+        WHERE Country = ''' || country_name || '''
+      ) AS source
+      ON target.Customer_Id = source.Customer_Id
+      AND target.Country = source.Country
+      WHEN MATCHED AND target.Consul_Dt < source.Consul_Dt THEN
+        UPDATE SET 
+        target.name = source.name,
+        target.cust_i = source.cust_i,
+        target.open_dt = source.Open_Dt,
+        target.Consul_Dt = source.Consul_Dt,
+        target.vac_id = source.Vaccination_Id,
+        target.dr_name = source.Dr_Name,
+        target.state = source.State,
+        target.country = source.Country,
+        target.DOB = source.DOB,
+        target.Age = source.age,
+        target.Days_Since_Last_Consulted = source.Days_Since_Last_Consulted;
+      WHEN NOT MATCHED THEN
+        INSERT (name,cust_i,open_dt,Consul_Dt,vac_id,dr_name,state,country,DOB,flag,age,Days_Since_Last_Consulted)
+        VALUES (source.name, source.cust_i, source.Open_Dt, source.Consul_Dt, source.Vac_Id, source.Dr_Name, source.State, source.Country, source.DOB, source.flag,source.age, source.Days_Since_Last_Consulted);
+    ';
+  END FOR;
+  RETURN 'Customer data updated successfully';
+END;
+$$;
+
+
+--Create a task to call this procedure daily:
+CREATE OR REPLACE TASK task_update_data
+  WAREHOUSE = 'warehouse name'
+  SCHEDULE = 'time to schedule' 
+AS
+  CALL update_data();
+
